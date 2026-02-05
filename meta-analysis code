@@ -1,0 +1,423 @@
+The below R script was designed to automate the synthesis of the systematic review data. It ingests raw study data (in Excel format) and generates a suite of appendices, including statistical sensitivity analyses, forest plots, effect direction plots, and vote counting tables.
+•	Automated meta-analysis: Performs REML meta-analysis, calculates pooled hazard ratios (HRs), and runs sensitivity tests (Risk of Bias stratification, Meta-regression, Leave-one-out analysis, Geographic stratification, Der-Simonian Laird meta-analysis).
+•	Visualisation: Creates forest plots (HTML/SVG), Effect Direction Plots (EDP), and formatted summary tables using the gt package.
+•	Data handling: Includes built-in error handling to manage missing data points, non-numeric confidence intervals, and type mismatches without crashing the pipeline.
+Prerequisites
+1.	R & RStudio: A recent version of R (4.0+) is recommended.
+2.	Google Chrome: Required by the pagedown package to render PDF outputs from HTML.
+3.	Data structure: Input Excel files must contain a "RawData" sheet with the following standard columns: Study, Population, Cause, HR, Lower_CI, Upper_CI, Risk_of_Bias, Adjustment, Age_Group, Exposure.
+Usage
+1.	Configure paths: Open the script and update the setwd() path to point to your data directory.
+2.	Verify metadata: Ensure the meta dataframe matches your specific filenames and desired section titles.
+3.	Run: Execute the entire script. All outputs will be generated in the specified Output_Appendices folder.
+# 
+
+# 1. Setup & libraries
+# ------------------------------------------------------------------------------
+# Load required packages, installing any that are missing
+pkgs <- c("readxl", "writexl", "dplyr", "tidyr", "metafor", "ggplot2", 
+          "officer", "flextable", "gt", "htmltools", "stringr", "grid", "pagedown", "xtable")
+
+new_pkgs <- pkgs[!(pkgs %in% installed.packages()[,"Package"])]
+if(length(new_pkgs)) install.packages(new_pkgs, quiet = TRUE)
+suppressPackageStartupMessages(lapply(pkgs, library, character.only = TRUE))
+
+# Set wd
+# REPLACE THIS PATH with the folder containing your raw .xlsx data files
+setwd("PATH/TO/YOUR/DATA/FOLDER")
+
+# Create output directory
+out_dir <- "Output_Appendices"
+if (!dir.exists(out_dir)) dir.create(out_dir)
+
+# 2. Analysis metadata
+# ------------------------------------------------------------------------------
+# Define scope of the review: files, section IDs, and descriptive labels
+meta <- data.frame(
+  file = c(
+    "FO_AC_rawdata.xlsx", "FO_CS_rawdata.xlsx", "EC_AC_rawdata.xlsx", "EC_CS_rawdata.xlsx",
+    "PE_AC_rawdata.xlsx", "PE_CS_rawdata.xlsx", "FE_AC_rawdata.xlsx", "FE_CS_rawdata.xlsx",
+    "ME_AC_rawdata.xlsx", "ME_CS_rawdata.xlsx", "Amenities_AC_rawdata.xlsx", "Amenities_CS_rawdata.xlsx",
+    "Cleanliness_AC_rawdata.xlsx", "Cleanliness_CS_rawdata.xlsx", "Housingcond_AC_rawdata.xlsx",
+    "housingtype_AC_rawdata.xlsx", "Overcrowding_AC_rawdata.xlsx", "Overcrowding_CS_rawdata.xlsx",
+    "Tenure_CS_rawdata.xlsx", "Ventilation_AC_rawdata.xlsx", "Ventilation_CS_rawdata.xlsx"
+  ),
+  id = c(
+    "3.1", "3.2", "3.3", "3.4", "3.5", "3.6", "3.7", "3.8", "3.9", "3.10",
+    "3.11", "3.12", "3.13", "3.14", "3.15", "3.16", "3.17", "3.18", "3.19", "3.20", "3.21"
+  ),
+  exp = c(
+    "Father's occupation", "Father's occupation", "Economic circumstances", "Economic circumstances",
+    "Parental education", "Parental education", "Father's education", "Father's education",
+    "Mother's education", "Mother's education", "Amenities", "Amenities",
+    "Cleanliness", "Cleanliness", "Housing conditions", "Housing type",
+    "Overcrowding", "Overcrowding", "Tenure", "Ventilation", "Ventilation"
+  ),
+  out = c(
+    "all cause mortality", "cause-specific mortality", "all cause mortality", "cause-specific mortality",
+    "all cause mortality", "cause-specific mortality", "all cause mortality", "cause-specific mortality",
+    "all cause mortality", "cause-specific mortality", "all cause mortality", "cause-specific mortality",
+    "all cause mortality", "cause-specific mortality", "all cause mortality", "all cause mortality",
+    "all cause mortality", "cause-specific mortality", "cause-specific mortality", "all cause mortality",
+    "cause-specific mortality"
+  ),
+  stringsAsFactors = FALSE
+)
+
+# 3. Data loading & cleaning
+# ------------------------------------------------------------------------------
+# loads excel files, handling missing columns and type mismatches
+load_data <- function(meta_df) {
+  d_list <- list(); d_comb <- data.frame()
+  
+  for (i in 1:nrow(meta_df)) {
+    f <- meta_df$file[i]
+    if (file.exists(f)) {
+      # Read raw data and force all columns to character initially to prevent binding errors
+      tmp <- tryCatch(read_excel(f, sheet = "RawData"), error = function(e) read_excel(f))
+      tmp <- tmp %>% mutate(across(everything(), as.character))
+      
+      # Restore numeric types for statistical analysis
+      tmp$HR <- suppressWarnings(as.numeric(tmp$HR))
+      tmp$Lower_CI <- suppressWarnings(as.numeric(tmp$Lower_CI))
+      tmp$Upper_CI <- suppressWarnings(as.numeric(tmp$Upper_CI))
+      
+      # Filter invalid data rows (missing or non-positive confidence intervals)
+      tmp <- tmp %>% filter(!is.na(HR) & !is.na(Lower_CI) & !is.na(Upper_CI) & HR > 0 & Lower_CI > 0 & Upper_CI > 0)
+      
+      # Set default values for missing structural columns
+      if(!"Age_Group" %in% names(tmp)) tmp$Age_Group <- "All ages"
+      if(!"Exposure" %in% names(tmp)) tmp$Exposure <- "Not specified"
+      if(!"Adjustment" %in% names(tmp)) tmp$Adjustment <- "Not specified"
+      if(!"Cause" %in% names(tmp)) tmp$Cause <- "All cause"
+      
+      tmp$Age_Group[is.na(tmp$Age_Group)] <- "All ages"
+      tmp$Exposure[is.na(tmp$Exposure)] <- "Not specified"
+      tmp$Adjustment[is.na(tmp$Adjustment)] <- "Not specified"
+      
+      # Standardize 'Risk of Bias' naming convention
+      if("Risk_of_Bias" %in% names(tmp)) {
+        tmp$Risk_of_Bias <- str_to_sentence(tmp$Risk_of_Bias)
+        tmp$Risk_of_Bias <- gsub("Very high", "Very high", tmp$Risk_of_Bias, ignore.case=T)
+      }
+      
+      # Append metadata for tracking
+      tmp$Meta_ID <- meta_df$id[i]
+      tmp$Meta_Exp <- meta_df$exp[i]
+      tmp$Meta_Out <- meta_df$out[i]
+      
+      d_list[[f]] <- tmp
+      d_comb <- bind_rows(d_comb, tmp)
+    }
+  }
+  return(list(list=d_list, df=d_comb))
+}
+data_raw <- load_data(meta)
+
+# 4. Meta analysis helper
+# ------------------------------------------------------------------------------
+# Safely runs rma(), handling convergence failures or insufficient data
+safe_meta <- function(log_hr, se, method="REML") {
+  tryCatch({
+    if(length(log_hr) < 2) return(list(est="-", l="-", u="-", i2="-", tau2="-", q="-", p="-"))
+    
+    res <- rma(yi=log_hr, sei=se, method=method, control=list(stepadj=0.5, maxiter=1000))
+    
+    list(
+      est = sprintf("%.2f", exp(res$beta)),
+      l = sprintf("%.2f", exp(res$ci.lb)),
+      u = sprintf("%.2f", exp(res$ci.ub)),
+      i2 = sprintf("%.1f", res$I2),
+      tau2 = sprintf("%.3f", res$tau2),
+      q = sprintf("%.2f", res$QE),
+      p = sprintf("%.3f", res$QEp)
+    )
+  }, error = function(e) {
+    list(est="-", l="-", u="-", i2="-", tau2="-", q="-", p="-")
+  })
+}
+
+# 5. Appendix E: Sensitivity analyses
+# ------------------------------------------------------------------------------
+build_appendix_e <- function(d_list, meta_df, output_base) {
+  
+  doc <- read_docx() %>% body_add_par("Appendix E: Sensitivity Analyses", style = "heading 1")
+  
+  # HTML buffer for PDF conversion
+  html_out <- c("<!DOCTYPE html><html><head><style>
+    body { font-family: 'Times New Roman', sans-serif; padding: 40px; }
+    h1 { border-bottom: 2px solid #000; padding-bottom: 10px; }
+    h2 { background-color: #f0f0f0; padding: 5px; margin-top: 30px; border-left: 5px solid #333; }
+    h3 { margin-top: 20px; color: #444; text-decoration: underline;}
+    table { width: 100%; border-collapse: collapse; margin-bottom: 20px; font-size: 10pt; }
+    th { border-bottom: 2px solid #000; text-align: left; padding: 4px; background: #fafafa; }
+    td { border-bottom: 1px solid #ddd; padding: 4px; vertical-align: top; }
+  </style></head><body><h1>Appendix E: Sensitivity Analyses</h1>")
+  
+  se_calc <- function(hr, l, u) (log(u) - log(l)) / 3.92
+  
+  for (i in 1:nrow(meta_df)) {
+    f <- meta_df$file[i]
+    if (is.null(d_list[[f]])) next
+    df <- d_list[[f]]
+    if(nrow(df) == 0) next
+    
+    # Calculate log HR and SE
+    df$log_hr <- log(df$HR)
+    df$se <- se_calc(df$HR, df$Lower_CI, df$Upper_CI)
+    df <- df %>% filter(is.finite(log_hr) & is.finite(se) & se > 0)
+    if(nrow(df) == 0) next
+    
+    # Add Section Title
+    title_txt <- paste(meta_df$id[i], meta_df$exp[i], "-", meta_df$out[i])
+    doc <- body_add_par(doc, title_txt, style = "heading 2")
+    html_out <- c(html_out, paste0("<h2>", title_txt, "</h2>"))
+    
+    # --- 5.1 Main Pooled Estimates ---
+    grps <- df %>% group_by(Population, Cause, Exposure, Age_Group) %>% filter(n() > 1)
+    keys <- group_keys(grps)
+    
+    if(nrow(keys) > 0) {
+      res_rows <- list()
+      for(k in 1:nrow(keys)) {
+        sub <- df %>% filter(Population==keys$Population[k], Cause==keys$Cause[k], Exposure==keys$Exposure[k], Age_Group==keys$Age_Group[k])
+        m <- safe_meta(sub$log_hr, sub$se, "REML")
+        res_rows[[k]] <- data.frame(
+          Population = keys$Population[k], Cause = keys$Cause[k], Exposure = keys$Exposure[k],
+          Age_Group = keys$Age_Group[k], Method = "REML", N_Studies = nrow(sub),
+          N_Appropriate = sum(grepl("Appropriate", sub$Adjustment, ignore.case=T)),
+          N_Under = sum(grepl("Under", sub$Adjustment, ignore.case=T)),
+          N_Over = sum(grepl("Over", sub$Adjustment, ignore.case=T)),
+          Adjustment = paste(unique(sub$Adjustment), collapse=", "),
+          Pooled_HR = m$est, Lower = m$l, Upper = m$u, I2 = m$i2
+        )
+      }
+      res_main <- bind_rows(res_rows)
+      doc <- body_add_par(doc, "Main Pooled Estimates", style = "heading 3")
+      doc <- body_add_flextable(doc, flextable(res_main) %>% theme_vanilla() %>% fontsize(size=8) %>% autofit())
+      html_out <- c(html_out, "<h3>Main Pooled Estimates</h3>", print(xtable(res_main), type="html", print.results=FALSE))
+    }
+    
+    # --- 5.2 Risk of Bias Stratification ---
+    grps_rob <- df %>% group_by(Population, Age_Group, Cause, Risk_of_Bias) %>% filter(n() > 1)
+    keys_rob <- group_keys(grps_rob)
+    
+    if(nrow(keys_rob) > 0) {
+      rob_rows <- list()
+      for(k in 1:nrow(keys_rob)) {
+        sub <- df %>% filter(Population==keys_rob$Population[k], Age_Group==keys_rob$Age_Group[k],
+                             Cause==keys_rob$Cause[k], Risk_of_Bias==keys_rob$Risk_of_Bias[k])
+        m <- safe_meta(sub$log_hr, sub$se, "REML")
+        rob_rows[[k]] <- data.frame(
+          Population=keys_rob$Population[k], Age=keys_rob$Age_Group[k], Cause=keys_rob$Cause[k],
+          RoB=keys_rob$Risk_of_Bias[k], Adj=paste(unique(sub$Adjustment), collapse=", "),
+          N=nrow(sub), Pooled_HR=m$est, CI=paste0(m$l, "-", m$u), I2=m$i2
+        )
+      }
+      res_rob <- bind_rows(rob_rows)
+      doc <- body_add_par(doc, "Sensitivity: Stratification by Risk of Bias", style = "heading 3")
+      doc <- body_add_flextable(doc, flextable(res_rob) %>% theme_vanilla() %>% fontsize(size=8) %>% autofit())
+      html_out <- c(html_out, "<h3>Sensitivity: Stratification by Risk of Bias</h3>", print(xtable(res_rob), type="html", print.results=FALSE))
+    }
+    
+    # --- 5.3 Meta-Regression ---
+    if(length(unique(df$Risk_of_Bias)) > 1 && nrow(df) >= 3) {
+      mr <- tryCatch({
+        fit <- rma(yi=log_hr, sei=se, mods = ~factor(Risk_of_Bias), data=df, method="REML")
+        data.frame(Population="All", Cause="All", RoB_Cats=paste(unique(df$Risk_of_Bias), collapse=", "),
+                   QM=sprintf("%.3f", fit$QM), P=sprintf("%.3f", fit$QMp),
+                   Significance=ifelse(fit$QMp < 0.05, "Significant", "Not significant"))
+      }, error=function(e) NULL)
+      
+      if(!is.null(mr)) {
+        doc <- body_add_par(doc, "Meta-regression", style="heading 3")
+        doc <- body_add_flextable(doc, flextable(mr) %>% theme_vanilla() %>% fontsize(size=8) %>% autofit())
+        html_out <- c(html_out, "<h3>Meta-regression</h3>", print(xtable(mr), type="html", print.results=FALSE))
+      }
+    }
+    
+    # --- 5.4 REML vs DL Comparison ---
+    if(nrow(keys) > 0) {
+      meth_rows <- list()
+      for(k in 1:nrow(keys)) {
+        sub <- df %>% filter(Population==keys$Population[k], Cause==keys$Cause[k])
+        m_reml <- safe_meta(sub$log_hr, sub$se, "REML")
+        m_dl <- safe_meta(sub$log_hr, sub$se, "DL")
+        
+        diff <- "-"
+        if(m_reml$est != "-" && m_dl$est != "-") diff <- sprintf("%.3f", as.numeric(m_reml$est) - as.numeric(m_dl$est))
+        
+        meth_rows[[k]] <- data.frame(
+          Population=keys$Population[k], Cause=keys$Cause[k], N=nrow(sub),
+          REML=m_reml$est, DL=m_dl$est, Diff=diff
+        )
+      }
+      res_meth <- bind_rows(meth_rows)
+      doc <- body_add_par(doc, "Method Sensitivity (REML vs DL)", style="heading 3")
+      doc <- body_add_flextable(doc, flextable(res_meth) %>% theme_vanilla() %>% fontsize(size=8) %>% autofit())
+      html_out <- c(html_out, "<h3>Method Sensitivity</h3>", print(xtable(res_meth), type="html", print.results=FALSE))
+    }
+    
+    # --- 5.5 Leave-One-Out Analysis ---
+    if(nrow(keys) > 0) {
+      loo_total <- data.frame()
+      for(k in 1:min(nrow(keys), 5)) { # Limit to 5 groups for brevity
+        sub <- df %>% filter(Population==keys$Population[k], Cause==keys$Cause[k])
+        if(nrow(sub) < 3) next
+        
+        tryCatch({
+          res_overall <- rma(yi=log_hr, sei=se, data=sub, method="REML")
+          inf <- leave1out(res_overall)
+          
+          tmp <- data.frame(
+            Analysis=paste(keys$Population[k], keys$Cause[k], sep="-"),
+            Excluded=sub$Study, Adj=sub$Adjustment,
+            LOO_HR=sprintf("%.3f", exp(inf$estimate)),
+            Overall=sprintf("%.3f", exp(res_overall$beta)),
+            Pct_Change=sprintf("%.2f%%", (exp(inf$estimate)-exp(res_overall$beta))/exp(res_overall$beta)*100)
+          )
+          loo_total <- bind_rows(loo_total, tmp)
+        }, error=function(e) NULL)
+      }
+      
+      if(nrow(loo_total) > 0) {
+        doc <- body_add_par(doc, "Leave-One-Out Analysis", style="heading 3")
+        doc <- body_add_flextable(doc, flextable(loo_total) %>% theme_vanilla() %>% fontsize(size=7) %>% autofit())
+        html_out <- c(html_out, "<h3>Leave-One-Out Analysis</h3>", print(xtable(loo_total), type="html", print.results=FALSE))
+      }
+    }
+    doc <- body_add_break(doc)
+    html_out <- c(html_out, "<hr>")
+  }
+  
+  # Save Word Doc
+  print(doc, target = paste0(output_base, ".docx"))
+  
+  # Save PDF via HTML
+  html_out <- c(html_out, "</body></html>")
+  html_file <- paste0(output_base, ".html")
+  writeLines(html_out, html_file)
+  tryCatch({
+    pagedown::chrome_print(html_file, output = paste0(output_base, ".pdf"))
+  }, error=function(e) message("PDF failed (Chrome required). Word doc saved."))
+}
+
+# 6. Appendix K: forest plots
+# ------------------------------------------------------------------------------
+build_appendix_k <- function(d_list, meta_df, output_path) {
+  css <- "body{font-family:Segoe UI;font-size:10pt} h2{color:#0056b3;border-left:5px solid #0056b3;padding-left:10px} table{width:100%;border-collapse:collapse;margin-bottom:20px} th{background:#f8f9fa;text-align:left;padding:8px} td{border-bottom:1px solid #eee;padding:6px} .badge{padding:3px 8px;border-radius:12px;font-weight:bold;width:80px;text-align:center} .bg-low{background:#e6f4ea;color:#1e7e34} .bg-some{background:#fff3cd;color:#856404} .bg-high{background:#fff3cd;color:#856404} .bg-very-high{background:#f8d7da;color:#721c24} svg{vertical-align:middle}"
+  html <- c("<!DOCTYPE html><html><head><meta charset='UTF-8'><style>", css, "</style></head><body><h1>Appendix K: All direct effect estimates</h1>")
+  
+  for (i in 1:nrow(meta_df)) {
+    f <- meta_df$file[i]
+    if (is.null(d_list[[f]])) next
+    df <- d_list[[f]] %>% filter(!is.na(HR))
+    if(nrow(df) == 0) next
+    html <- c(html, paste0("<h2>", meta_df$id[i], " ", meta_df$exp[i], " - ", meta_df$out[i], "</h2>"), "<table><thead><tr><th>Study</th><th>Pop</th><th>Cause</th><th>Forest Plot</th><th>HR (95% CI)</th><th>Risk of Bias</th></tr></thead><tbody>")
+    for (r in 1:nrow(df)) {
+      hr<-df$HR[r]; l<-df$Lower_CI[r]; u<-df$Upper_CI[r]; rob<-df$Risk_of_Bias[r]
+      cls<-case_when(grepl("low",rob,ignore.case=T)~"bg-low", grepl("some",rob,ignore.case=T)~"bg-some", grepl("very high",rob,ignore.case=T)~"bg-very-high", TRUE~"bg-high")
+      w<-150; mn<-log(0.2); mx<-log(5.0); rng<-mx-mn
+      x_hr<-max(0,min(w,(log(hr)-mn)/rng*w)); x_l<-max(0,min(w,(log(l)-mn)/rng*w)); x_u<-max(0,min(w,(log(u)-mn)/rng*w)); x_1<-(log(1)-mn)/rng*w
+      svg<-sprintf('<svg width="%d" height="16"><line x1="%f" y1="0" x2="%f" y2="16" stroke="#999" stroke-width="1" stroke-dasharray="2,2"/><line x1="%f" y1="8" x2="%f" y2="8" stroke="black" stroke-width="1.5"/><rect x="%f" y="6" width="4" height="4" fill="black"/></svg>', w, x_1, x_1, x_l, x_u, x_hr-2)
+      html <- c(html, paste0("<tr><td>", df$Study[r], "</td><td>", df$Population[r], "</td><td>", df$Cause[r], "</td><td>", svg, "</td><td>", sprintf("%.2f (%.2f-%.2f)", hr, l, u), "</td><td><span class='badge ", cls, "'>", rob, "</span></td></tr>"))
+    }
+    html <- c(html, "</tbody></table>")
+  }
+  html <- c(html, "</body></html>")
+  writeLines(html, output_path)
+}
+
+# 7. Visuals
+# ------------------------------------------------------------------------------
+build_artifacts <- function(df, out_dir) {
+  clean <- df %>% filter(!is.na(HR)) %>%
+    mutate(HR=as.numeric(HR), Dir=case_when(HR>1.05~"Harm", HR<0.95~"Benefit", TRUE~"Equivocal"),
+           Dom=case_when(grepl("all.?cause", Meta_Out, ignore.case=T)~"All-cause mortality", grepl("cancer", Cause, ignore.case=T)~"Cancer", grepl("cvd|cardio", Cause, ignore.case=T)~"CVD", grepl("external", Cause, ignore.case=T)~"External causes", TRUE~"Other/natural causes"),
+           RoB=factor(Risk_of_Bias, levels=c("Low", "Some concerns", "High", "Very high")))
+  
+  # J: Vote Count
+  summ <- clean %>% group_by(Meta_Exp, Dom) %>% summarise(Total=n(), Harm=sum(Dir=="Harm"), Ben=sum(Dir=="Benefit"), Neut=sum(Dir=="Equivocal"), .groups="drop") %>%
+    rowwise() %>% mutate(n=Harm+Ben, p=if(n>0) binom.test(Harm,n)$p.value else NA, pct=if(n>0) Harm/n*100 else 0) %>%
+    mutate(Pct=sprintf("%.1f%%", pct), Pval=ifelse(is.na(p), "-", sprintf("%.3f", p)))
+  gt_j <- summ %>% select(Meta_Exp, Dom, Total, Harm, Ben, Neut, Pct, Pval) %>% gt(groupname_col="Meta_Exp") %>% tab_header(title="Appendix J: Vote count table")
+  gtsave(gt_j, file.path(out_dir, "Appendix_J.html"))
+  
+  # O: EDP Plot
+  p_o <- ggplot(clean, aes(x=Dom, y=reorder(Study, desc(Study)))) +
+    geom_point(aes(fill=RoB, shape=Dir), size=3, stroke=0.2, position=position_jitter(width=0.2, height=0.1)) +
+    scale_fill_manual(values=c("Low"="#2ca02c", "Some concerns"="#ff7f0e", "High"="#d62728", "Very high"="#8c564b")) +
+    scale_shape_manual(values=c("Harm"=24, "Benefit"=25, "Equivocal"=21)) +
+    facet_grid(Meta_Exp~., scales="free", space="free_y", switch="y") + theme_bw() + theme(strip.text.y.left=element_text(angle=0))
+  ggsave(file.path(out_dir, "Appendix_O_EDP.pdf"), p_o, width=12, height=22)
+  
+  # P: Direction
+  gt_p <- clean %>% select(Meta_Exp, Dom, Study, Cause, Dir, RoB) %>% arrange(Meta_Exp, Dom) %>% group_by(Meta_Exp, Dom) %>% gt() %>% data_color(columns=RoB, palette=c("#e6f4ea", "#fff3cd", "#ffeeba", "#f8d7da")) %>% tab_header(title="Appendix P")
+  gtsave(gt_p, file.path(out_dir, "Appendix_P.html"))
+  
+  # Q: Sign Test
+  q_dat <- clean %>% mutate(Bin=ifelse(HR>1, "Harm", "Benefit")) %>% group_by(Meta_Exp, Cause) %>% summarise(Total=n(), Harm=sum(Bin=="Harm"), Benefit=sum(Bin=="Benefit"), .groups="drop") %>% rowwise() %>% mutate(p=binom.test(Harm,Total)$p.value, Sig=ifelse(p<0.05, "Significant", "Not significant"), Pval=sprintf("%.3f", p)) %>% arrange(desc(Total))
+  gt_q <- q_dat %>% select(Meta_Exp, Cause, Total, Harm, Benefit, Pval, Sig) %>% gt() %>% tab_header(title="Appendix Q: Sign test results") %>% tab_style(style=cell_text(color="red", weight="bold"), locations=cells_body(columns=Sig, rows=Sig=="Significant"))
+  gtsave(gt_q, file.path(out_dir, "Appendix_Q.html"))
+}
+
+# 8. Execution
+message("Generating Appendix E (Word & PDF)...")
+build_appendix_e(data_raw$list, meta, file.path(out_dir, "Appendix_E"))
+message("Generating Appendix K (Forest Plots)...")
+build_appendix_k(data_raw$list, meta, file.path(out_dir, "Appendix_K.html"))
+message("Generating J, O, P, Q...")
+build_artifacts(data_raw$df, out_dir)
+
+Overview of rendering process
+Forest plots were initially generated as interactive HTML files. To incorporate them into the manuscript as static figures, a dedicated R script was used to render these files into high-resolution Portable Network Graphics (PNG) format.
+The script uses the webshot2 package, which leverages a headless Chrome browser to capture the HTML content. A batch processing function was implemented to iterate through specific file lists (e.g., main analysis, cause-specific, RII), applying consistent resolution settings (zoom = 2) and viewport dimensions to ensure legibility and uniform formatting across all publication diagrams.
+
+Code
+R
+library(webshot2)
+
+# Set working directory to input folder
+setwd(UYPDATE WITH YOUR FILE PATH)
+
+# Function to batch convert files with consistent settings
+convert_batch <- function(file_list, height = 1100) {
+  for (file in file_list) {
+    if (file.exists(file)) {
+      output_name <- gsub(".html", ".png", file)
+      
+      # Render to high-res PNG
+      webshot(
+        url = file,
+        file = output_name,
+        zoom = 2,           # 2x zoom for publication quality
+        vwidth = 900,       # Fixed width to prevent text wrapping
+        vheight = height,   # Variable height based on content
+        selector = "body"
+      )
+      message(paste("Successfully rendered:", output_name))
+    } else {
+      message(paste("Skipping missing file:", file))
+    }
+  }
+}
+
+# 1. Father's occupation x All-cause mortality
+files_fo_ac <- c("fo_ac_both.html", "fo_ac_male.html", "fo_ac_female.html")
+convert_batch(files_fo_ac, height = 1100)
+
+# 2. Father's occupation x Cause-specific mortality
+files_fo_cs <- c("fo_cs_both.html", "fo_cs_male.html", "fo_cs_female.html")
+convert_batch(files_fo_cs, height = 600)
+
+# 3. Economic circumstances x All-cause mortality
+files_ec_ac <- c("ec_ac_both.html", "ec_ac_male.html", "ec_ac_female.html")
+convert_batch(files_ec_ac, height = 600)
+
+# 4. Relative Index of Inequality (RII) plots
+# Switch directory for RII specific files
+setwd("UPDATE WITH UYOUR FILE PATH")
+
+files_rii <- c("rii_fo_ac_both.html", "rii_fo_ac_male.html", "rii_fo_ac_female.html")
+convert_batch(files_rii, height = 600)
+
